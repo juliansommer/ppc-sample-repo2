@@ -1,0 +1,55 @@
+name: GitHub Projects Automation
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-issue-to-done:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        # Step 1: Checks out the repository to the runner's environment
+        uses: actions/checkout@v2
+
+      - name: Check if PR is merged
+        # Step 2: If the PR was merged, move its linked issues to the "Done" column
+        if: github.event.pull_request.merged == true
+        env:
+          TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gql() {
+            curl -sS -X POST https://api.github.com/graphql \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$1"
+          }
+
+          # Find the project board items of every issue closed by this PR
+          QUERY='query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$pr){closingIssuesReferences(first:20){nodes{number projectItems(first:20){nodes{id project{id title field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}}}}}}}}}'
+          PAYLOAD=$(jq -n --arg q "$QUERY" --arg owner "$OWNER" --arg repo "$REPO" --argjson pr "$PR_NUMBER" \
+            '{query:$q,variables:{owner:$owner,repo:$repo,pr:$pr}}')
+          RESPONSE=$(gql "$PAYLOAD")
+          echo "$RESPONSE" | jq -e '.errors == null' > /dev/null || { echo "$RESPONSE"; exit 1; }
+
+          ITEMS=$(echo "$RESPONSE" | jq -c '.data.repository.pullRequest.closingIssuesReferences.nodes[]
+            | .number as $issue | .projectItems.nodes[]
+            | {issue:$issue, item:.id, project:.project.id, title:.project.title, field:.project.field.id,
+               option:(.project.field.options[] | select(.name=="Done") | .id)}')
+
+          if [ -z "$ITEMS" ]; then
+            echo "No linked issues found on a project board"
+            exit 0
+          fi
+
+          MUTATION='mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}'
+          echo "$ITEMS" | while read -r row; do
+            PAYLOAD=$(jq -n --arg q "$MUTATION" --argjson r "$row" \
+              '{query:$q,variables:{project:$r.project,item:$r.item,field:$r.field,option:$r.option}}')
+            RESULT=$(gql "$PAYLOAD")
+            echo "$RESULT" | jq -e '.errors == null' > /dev/null || { echo "$RESULT"; exit 1; }
+            echo "Moved issue #$(echo "$row" | jq -r .issue) to Done in $(echo "$row" | jq -r .title)"
+          done
